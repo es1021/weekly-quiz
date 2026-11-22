@@ -12,6 +12,29 @@ from google.genai import types
 # ---------- 기본 설정 ----------
 st.set_page_config(page_title="주간 퀴즈 학습", page_icon="📚", layout="wide")
 
+# ---------- 비밀번호 잠금 ----------
+def check_password():
+    try:
+        pw = st.secrets.get("APP_PASSWORD")
+    except Exception:
+        pw = None
+    if not pw:
+        return  # 비밀번호 미설정 시(로컬 테스트) 통과
+    if st.session_state.get("authed"):
+        return
+    st.title("🔒 주간 퀴즈 학습")
+    entered = st.text_input("비밀번호", type="password")
+    if entered == pw:
+        st.session_state["authed"] = True
+        st.rerun()
+    elif entered:
+        st.error("비밀번호가 틀렸어요.")
+    st.stop()
+
+
+check_password()
+
+
 DATA_DIR = Path("data")
 PDF_DIR = DATA_DIR / "pdfs"
 DB_FILE = DATA_DIR / "db.json"
