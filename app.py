@@ -63,6 +63,7 @@ def new_week():
     return {
         "pdf": None,
         "important": "",
+        "summary": "",
         "snippets": [],
         "memo": "",
         "quiz": [],
@@ -85,7 +86,7 @@ def get_api_key():
     return key or st.session_state.get("api_key_input")
 
 
-def ask_gemini(prompt, pdf_bytes=None, model="gemini-2.5-flash"):
+def ask_gemini(prompt, pdf_bytes=None, model="gemini-2.5-flash", as_json=True):
     key = get_api_key()
     if not key:
         st.error("사이드바에 Gemini API 키를 입력하세요.")
@@ -95,18 +96,37 @@ def ask_gemini(prompt, pdf_bytes=None, model="gemini-2.5-flash"):
     if pdf_bytes:
         contents.append(types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"))
     contents.append(prompt)
-    resp = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
+    config = types.GenerateContentConfig(response_mime_type="application/json") if as_json else None
+    resp = client.models.generate_content(model=model, contents=contents, config=config)
     text = resp.text.strip()
+    if not as_json:
+        return text
     text = re.sub(r"^```(?:json)?|```$", "", text).strip()
     return json.loads(text)
 
 
-def build_context(w):
+def generate_summary(w, level, model):
+    pdf_bytes = Path(w["pdf"]).read_bytes()
+    extra = ""
+    if w["important"].strip() or w["snippets"]:
+        extra = "\n학생이 표시한 아래 '중요 부분'은 더 자세히 다뤄라.\n" + build_context(w, with_summary=False)
+    prompt = f"""첨부된 강의 PDF를 한국어로 요약해라. 요약 분량: {level}.
+마크다운 형식으로 아래 구성을 따른다.
+
+## 📌 한 줄 요약
+## 🔑 핵심 개념 (정의 포함)
+## 📖 상세 정리 (PDF 흐름에 따라 섹션별로)
+## ⚠️ 시험에 나올 만한 포인트
+## 📚 용어 정리 (표)
+
+코드가 있으면 코드 블록으로 보여주고 핵심 동작을 설명해라.{extra}"""
+    return ask_gemini(prompt, pdf_bytes, model, as_json=False)
+
+
+def build_context(w, with_summary=True):
     parts = []
+    if with_summary and w.get("summary", "").strip():
+        parts.append("[강의 요약]\n" + w["summary"])
     if w["important"].strip():
         parts.append("[중요 부분 메모]\n" + w["important"])
     for s in w["snippets"]:
@@ -237,18 +257,33 @@ if not week:
 
 w = db["subjects"][subject]["weeks"][week]
 wk = f"{subject}_{week}"  # 세션 키 구분용
+w.setdefault("summary", "")
 st.title(f"{subject} · {week}")
-tab1, tab2, tab3, tab4 = st.tabs(["📄 자료·중요 부분", "📝 퀴즈", "🗒️ 메모장", "📊 기록·오답"])
+tab1, tab_sum, tab2, tab3, tab4 = st.tabs(
+    ["📄 자료·중요 부분", "📑 요약", "📝 퀴즈", "🗒️ 메모장", "📊 기록·오답"]
+)
 
 # ---------- 탭1: 자료 / 중요 부분 ----------
 with tab1:
-    up = st.file_uploader("이번 주 강의 PDF", type="pdf")
+    up = st.file_uploader("이번 주 강의 PDF", type="pdf", key=f"pdf_{wk}")
+    auto_sum = st.checkbox("저장 후 Gemini로 자동 요약", value=True)
     if up and st.button("PDF 저장"):
         p = pdf_path(subject, week)
         p.write_bytes(up.getvalue())
         w["pdf"] = str(p)
+        w["summary"] = ""  # 새 PDF이므로 이전 요약 초기화
         save_db(db)
-        st.success("저장 완료")
+        st.success("PDF 저장 완료")
+        if auto_sum and get_api_key():
+            with st.spinner("요약 생성 중... (PDF 크기에 따라 시간이 걸려요)"):
+                try:
+                    w["summary"] = generate_summary(w, "보통", model)
+                    save_db(db)
+                    st.success("요약 완료! '📑 요약' 탭에서 확인하세요.")
+                except Exception as e:
+                    st.error(f"요약 실패: {e}  ('📑 요약' 탭에서 다시 시도할 수 있어요)")
+        elif auto_sum:
+            st.warning("API 키가 없어 요약을 건너뛰었어요.")
     if w["pdf"] and Path(w["pdf"]).exists():
         st.caption(f"현재 PDF: {Path(w['pdf']).name}")
 
@@ -279,6 +314,35 @@ with tab1:
                 w["snippets"].pop(i)
                 save_db(db)
                 st.rerun()
+
+# ---------- 요약 탭 ----------
+with tab_sum:
+    has_pdf = bool(w["pdf"] and Path(w["pdf"]).exists())
+    if not has_pdf:
+        st.info("먼저 '자료·중요 부분' 탭에서 PDF를 저장하세요.")
+    else:
+        c1, c2 = st.columns([3, 1])
+        level = c1.radio("요약 분량", ["간단", "보통", "자세히"], index=1, horizontal=True)
+        if c2.button("🔄 요약 (재)생성", type="primary", use_container_width=True):
+            with st.spinner("Gemini가 요약하는 중..."):
+                try:
+                    w["summary"] = generate_summary(w, level, model)
+                    save_db(db)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"요약 실패: {e}")
+    if w["summary"]:
+        st.markdown(w["summary"])
+        st.download_button("요약 다운로드(.md)", w["summary"], f"{subject}_{week}_summary.md")
+        st.success("요약을 다 읽었다면 '📝 퀴즈' 탭으로 이동하세요 👉")
+        with st.expander("✏️ 요약 직접 수정"):
+            edited = st.text_area("마크다운으로 수정", value=w["summary"], height=300, key=f"sum_edit_{wk}")
+            if st.button("수정 내용 저장"):
+                w["summary"] = edited
+                save_db(db)
+                st.rerun()
+    elif has_pdf:
+        st.caption("아직 요약이 없어요. 오른쪽 버튼으로 생성하세요.")
 
 # ---------- 탭2: 퀴즈 ----------
 with tab2:
