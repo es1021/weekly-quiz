@@ -12,6 +12,7 @@ from google.genai import types
 # ---------- 기본 설정 ----------
 st.set_page_config(page_title="주간 퀴즈 학습", page_icon="📚", layout="wide")
 
+
 # ---------- 비밀번호 잠금 ----------
 def check_password():
     try:
@@ -34,7 +35,6 @@ def check_password():
 
 check_password()
 
-
 DATA_DIR = Path("data")
 PDF_DIR = DATA_DIR / "pdfs"
 DB_FILE = DATA_DIR / "db.json"
@@ -45,9 +45,14 @@ LANGS = ["java", "python", "c", "cpp", "sql", "text"]
 
 # ---------- 저장소 ----------
 def load_db():
+    db = {"subjects": {}}
     if DB_FILE.exists():
-        return json.loads(DB_FILE.read_text(encoding="utf-8"))
-    return {"weeks": {}}
+        db = json.loads(DB_FILE.read_text(encoding="utf-8"))
+    if "weeks" in db:  # 과목 구분이 없던 구버전 데이터 → '기본' 과목으로 이동
+        db.setdefault("subjects", {})
+        db["subjects"].setdefault("기본", {"weeks": {}})["weeks"].update(db.pop("weeks"))
+    db.setdefault("subjects", {})
+    return db
 
 
 def save_db(db):
@@ -66,8 +71,8 @@ def new_week():
     }
 
 
-def pdf_path(week):
-    safe = re.sub(r"[^\w가-힣-]", "_", week)
+def pdf_path(subject, week):
+    safe = re.sub(r"[^\w가-힣-]", "_", f"{subject}_{week}")
     return PDF_DIR / f"{safe}.pdf"
 
 
@@ -172,20 +177,41 @@ with st.sidebar:
     model = st.text_input("모델", value="gemini-2.5-flash")
 
     st.divider()
-    weeks = list(db["weeks"].keys())
-    if weeks:
-        week = st.selectbox("주차 선택", weeks, index=len(weeks) - 1)
+    subjects = list(db["subjects"].keys())
+    if subjects:
+        subject = st.selectbox("과목 선택", subjects)
     else:
-        week = None
-        st.info("아래에서 주차를 추가하세요.")
-    new_name = st.text_input("새 주차 이름", value=f"{len(weeks) + 1}주차")
-    if st.button("➕ 주차 추가", use_container_width=True):
-        if new_name and new_name not in db["weeks"]:
-            db["weeks"][new_name] = new_week()
+        subject = None
+        st.info("아래에서 과목을 추가하세요.")
+    new_subject = st.text_input("새 과목 이름", placeholder="예: 알고리즘")
+    if st.button("➕ 과목 추가", use_container_width=True):
+        name = new_subject.strip()
+        if name and name not in db["subjects"]:
+            db["subjects"][name] = {"weeks": {}}
             save_db(db)
             st.rerun()
         else:
             st.warning("이름이 비었거나 이미 있어요.")
+
+    week = None
+    if subject:
+        st.divider()
+        weeks_dict = db["subjects"][subject]["weeks"]
+        weeks = list(weeks_dict.keys())
+        if weeks:
+            week = st.selectbox("주차 선택", weeks, index=len(weeks) - 1, key=f"week_sel_{subject}")
+        else:
+            st.info("아래에서 주차를 추가하세요.")
+        new_name = st.text_input(
+            "새 주차 이름", value=f"{len(weeks) + 1}주차", key=f"new_week_{subject}_{len(weeks)}"
+        )
+        if st.button("➕ 주차 추가", use_container_width=True):
+            if new_name and new_name not in weeks_dict:
+                weeks_dict[new_name] = new_week()
+                save_db(db)
+                st.rerun()
+            else:
+                st.warning("이름이 비었거나 이미 있어요.")
 
     st.divider()
     st.caption("무료 호스팅은 재부팅 시 파일이 사라질 수 있어요. 백업을 받아두세요.")
@@ -201,19 +227,24 @@ with st.sidebar:
             z.extractall(DATA_DIR)
         st.rerun()
 
+if not subject:
+    st.title("과목을 먼저 추가하세요 👈")
+    st.stop()
 if not week:
-    st.title("주차를 먼저 추가하세요 👈")
+    st.title(subject)
+    st.info("사이드바에서 주차를 추가하세요 👈")
     st.stop()
 
-w = db["weeks"][week]
-st.title(f"{week} 학습")
+w = db["subjects"][subject]["weeks"][week]
+wk = f"{subject}_{week}"  # 세션 키 구분용
+st.title(f"{subject} · {week}")
 tab1, tab2, tab3, tab4 = st.tabs(["📄 자료·중요 부분", "📝 퀴즈", "🗒️ 메모장", "📊 기록·오답"])
 
 # ---------- 탭1: 자료 / 중요 부분 ----------
 with tab1:
     up = st.file_uploader("이번 주 강의 PDF", type="pdf")
     if up and st.button("PDF 저장"):
-        p = pdf_path(week)
+        p = pdf_path(subject, week)
         p.write_bytes(up.getvalue())
         w["pdf"] = str(p)
         save_db(db)
@@ -262,20 +293,20 @@ with tab2:
                 try:
                     w["quiz"] = generate_quiz(w, n_mc, n_short, n_code, use_pdf, model)
                     save_db(db)
-                    st.session_state.pop(f"result_{week}", None)
-                    for k in [k for k in st.session_state if k.startswith(f"q_{week}_")]:
+                    st.session_state.pop(f"result_{wk}", None)
+                    for k in [k for k in st.session_state if k.startswith(f"q_{wk}_")]:
                         del st.session_state[k]
                     st.rerun()
                 except Exception as e:
                     st.error(f"생성 실패: {e}")
 
     quiz = w["quiz"]
-    result = st.session_state.get(f"result_{week}")
+    result = st.session_state.get(f"result_{wk}")
     if quiz:
         answers = []
         for i, q in enumerate(quiz):
             st.markdown(f"**Q{i + 1}. {q['question']}**")
-            key = f"q_{week}_{i}"
+            key = f"q_{wk}_{i}"
             if q["type"] == "mc":
                 a = st.radio("답", q["choices"], index=None, key=key, label_visibility="collapsed")
             elif q["type"] == "code":
@@ -301,7 +332,7 @@ with tab2:
                 except Exception as e:
                     st.error(f"채점 실패: {e}")
                     st.stop()
-            st.session_state[f"result_{week}"] = res
+            st.session_state[f"result_{wk}"] = res
             score = sum(r["correct"] for r in res)
             w["history"].append(
                 {"time": datetime.now().strftime("%Y-%m-%d %H:%M"), "score": score, "total": len(quiz)}
@@ -321,7 +352,7 @@ with tab3:
     if c1.button("메모 저장"):
         save_db(db)
         st.success("저장 완료")
-    c2.download_button("메모 다운로드(.txt)", w["memo"], f"{week}_memo.txt")
+    c2.download_button("메모 다운로드(.txt)", w["memo"], f"{subject}_{week}_memo.txt")
 
 # ---------- 탭4: 기록 / 오답 ----------
 with tab4:
