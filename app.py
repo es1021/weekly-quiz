@@ -1,6 +1,7 @@
 import io
 import json
 import re
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -86,7 +87,7 @@ def get_api_key():
     return key or st.session_state.get("api_key_input")
 
 
-def ask_gemini(prompt, pdf_bytes=None, model="gemini-2.5-flash", as_json=True):
+def ask_gemini(prompt, pdf_bytes=None, model="gemini-3.8-flash", as_json=True):
     key = get_api_key()
     if not key:
         st.error("사이드바에 Gemini API 키를 입력하세요.")
@@ -97,7 +98,27 @@ def ask_gemini(prompt, pdf_bytes=None, model="gemini-2.5-flash", as_json=True):
         contents.append(types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"))
     contents.append(prompt)
     config = types.GenerateContentConfig(response_mime_type="application/json") if as_json else None
-    resp = client.models.generate_content(model=model, contents=contents, config=config)
+    models = [model]
+    fallback = (st.session_state.get("fallback_model") or "").strip()
+    if fallback and fallback != model:
+        models.append(fallback)
+    retryable = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500")
+    last_err = None
+    resp = None
+    for m in models:
+        for attempt in range(3):  # 일시적 과부하(503 등)는 자동 재시도
+            try:
+                resp = client.models.generate_content(model=m, contents=contents, config=config)
+                break
+            except Exception as e:
+                last_err = e
+                if not any(c in str(e) for c in retryable):
+                    raise
+                time.sleep(3 * (attempt + 1))
+        if resp is not None:
+            break
+    if resp is None:
+        raise last_err
     text = resp.text.strip()
     if not as_json:
         return text
@@ -194,7 +215,8 @@ with st.sidebar:
         has_secret = False
     if not has_secret:
         st.text_input("Gemini API 키", type="password", key="api_key_input")
-    model = st.text_input("모델", value="gemini-2.5-flash")
+    model = st.text_input("모델", value="gemini-3.8-flash")
+    st.text_input("예비 모델 (선택)", key="fallback_model", help="기본 모델이 계속 과부하일 때 대신 쓸 모델 이름")
 
     st.divider()
     subjects = list(db["subjects"].keys())
